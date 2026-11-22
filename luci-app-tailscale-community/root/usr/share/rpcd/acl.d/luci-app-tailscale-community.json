@@ -5,6 +5,7 @@
 			"ubus": {
 				"tailscale": [
 					"get_status",
+					"get_diagnostics",
 					"get_settings",
 					"get_subroutes",
 					"get_logs",
