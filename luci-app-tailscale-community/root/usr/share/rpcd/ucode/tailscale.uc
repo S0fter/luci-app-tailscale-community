@@ -33,6 +33,15 @@ function shell_quote(s) {
 	return "'" + replace(s, "'", "'\\''") + "'";
 }
 
+function get_diagnostic_command(command) {
+	let result = exec(command);
+	let output = join('\n', result.stdout || []);
+	return {
+		output: output,
+		error: result.code != 0 ? ('Command exited with status ' + result.code) : ''
+	};
+}
+
 const methods = {};
 
 methods.get_status = {
@@ -90,6 +99,24 @@ methods.get_status = {
 
 		data.peers = peer_map;
 		return data;
+	}
+};
+
+// Keep diagnostics in a separate RPC method so the existing get_status
+// signature and its frequent poller remain completely unchanged.
+methods.get_diagnostics = {
+	call: function() {
+		if (access('/usr/sbin/tailscale') != true && access('/usr/bin/tailscale') != true)
+			return { status_details: null, error: 'Tailscale is not installed' };
+
+		return {
+			status_details: {
+				ip: get_diagnostic_command('tailscale ip'),
+				interface: get_diagnostic_command('ip addr show tailscale0'),
+				netcheck: get_diagnostic_command('tailscale netcheck'),
+				dns: get_diagnostic_command('tailscale dns status')
+			}
+		};
 	}
 };
 
@@ -496,7 +523,7 @@ methods.get_logs = {
 		// Filter first, then take the tail: logread -l would only hand the last
 		// N lines of every daemon to grep, so a busy box hides the tailscale
 		// records entirely and the log page claims there is nothing to show.
-		let cmd = 'logread 2>/dev/null | grep -i -E "tailscale" | tail -n ' + lines;
+		let cmd = 'logread 2>/dev/null | grep -i -E "tailscale|ts4" | tail -n ' + lines;
 		let result = exec(cmd);
 		if (result.code == 0) {
 			return { success: true, logs: result.stdout };
