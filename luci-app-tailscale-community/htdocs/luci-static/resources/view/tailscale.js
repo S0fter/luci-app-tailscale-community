@@ -7,6 +7,7 @@
 'require tools.widgets as widgets';
 
 const callGetStatus = rpc.declare({ object: 'tailscale', method: 'get_status' });
+const callGetStatusDiagnostics = rpc.declare({ object: 'tailscale', method: 'get_diagnostics' });
 const callGetSettings = rpc.declare({ object: 'tailscale', method: 'get_settings' });
 const callDoLogin = rpc.declare({ object: 'tailscale', method: 'do_login', params: ['form_data'] });
 const callDoLogout = rpc.declare({ object: 'tailscale', method: 'do_logout' });
@@ -17,6 +18,8 @@ const callSetServiceEnabled = rpc.declare({ object: 'tailscale', method: 'set_se
 const callGetFirewallStatus = rpc.declare({ object: 'tailscale', method: 'get_firewall_status' });
 let map;
 let lastDevicesStatus;
+let statusDetailsLoaded = false;
+let statusDetailsLoading = false;
 
 // ui.addTimeLimitedNotification only exists since OpenWrt 24.10. Older
 // releases, 23.05 included, only have addNotification and would throw on every
@@ -423,6 +426,54 @@ function renderStatus(status) {
 	return statusTable;
 }
 
+function renderStatusDetails(details) {
+ if (!details)
+   return E('em', {}, _('Open this tab or click Refresh to collect diagnostics.'));
+
+ const commands = [
+   ['tailscale ip', details.ip],
+   ['ip addr show tailscale0', details.interface],
+   ['tailscale netcheck', details.netcheck],
+   ['tailscale dns status', details.dns]
+ ];
+ return E('div', {}, commands.map(function(item, index) {
+   const result = item[1] || {};
+   let content = result.error ? result.error : (result.output || _('(no output)'));
+   // Remove trailing newline characters that create an extra blank line in <pre>.
+   content = String(content).replace(/[\r\n]+$/, '');
+   const scroll = index >= 2 ? 'max-height: 500px; overflow-y: auto;' : '';
+   return E('div', { 'style': 'margin-bottom: 1.5em; border: 1px solid #ccc; padding: 8px; border-radius: 3px;' }, [
+     E('h3', { 'style': 'margin-top: 0;' }, item[0]),
+     E('pre', { 'style': 'white-space: pre; font-family: monospace; font-size: 13px; line-height: 1.5; margin: 0; overflow-x: auto; ' + scroll }, content)
+   ]);
+ }));
+}
+
+function loadStatusDetails(force) {
+ if (statusDetailsLoading || (statusDetailsLoaded && !force))
+   return Promise.resolve();
+
+ const display = document.getElementById('tailscale_status_details');
+ if (!display)
+   return Promise.resolve();
+
+ statusDetailsLoading = true;
+ display.replaceChildren(E('em', {}, _('Collecting diagnostics ...')));
+ return callGetStatusDiagnostics().then(function(res) {
+   if (res && res.status_details) {
+     statusDetailsLoaded = true;
+     display.replaceChildren(renderStatusDetails(res.status_details));
+   }
+   else {
+     display.replaceChildren(E('em', {}, res && res.error ? res.error : _('No diagnostic data returned.')));
+   }
+ }).catch(function(err) {
+   display.replaceChildren(E('em', {}, _('Failed to load diagnostics: %s').format(err.message || _('Unknown error'))));
+ }).finally(function() {
+   statusDetailsLoading = false;
+ });
+}
+
 function renderLogs(logs_data) {
 	if (!logs_data || !logs_data.logs || logs_data.logs.length === 0) {
 		return E('em', {}, _('No tailscale-related logs found.'));
@@ -435,7 +486,7 @@ function renderLogs(logs_data) {
 	});
 
 	return E('div', {
-		'style': 'max-height: 500px; overflow-y: auto; background: #f5f5f5; border: 1px solid #ccc; padding: 8px; border-radius: 3px;'
+    'style': 'max-height: 500px; overflow-y: auto; border: 1px solid #ccc; padding: 8px; border-radius: 3px;'
 	}, lines);
 }
 
@@ -486,7 +537,7 @@ function renderPeerRows(status, query) {
 					'title': (peer.exit_node ? _('Exit Node') + ' ' : '') + (peer.online ? _('Online') : _('Offline'))
 				}, peer.online ? '●' : '○')
 			),
-			E('td', { 'class': 'cbi-value-field', 'style': td_style }, E('strong', {}, hostname + (peer.exit_node_option ? ' (ExNode)' : ''))),
+      E('td', { 'class': 'cbi-value-field', 'style': td_style }, E('pre', {}, hostname + (peer.exit_node_option ? ' (ExNode)' : ''))),
 			E('td', { 'class': 'cbi-value-field', 'style': td_style }, ip || 'N/A'),
 			E('td', { 'class': 'cbi-value-field', 'style': td_style }, ostype || 'N/A'),
 			E('td', { 'class': 'cbi-value-field', 'style': td_style }, formatConnectionInfo(peer.linkadress || '-')),
@@ -886,6 +937,18 @@ return view.extend({
 			return E('div', { 'id': 'tailscale_devices_display', 'class': 'cbi-value' }, renderDevices(status));
 		};
 
+    s.tab('diagnostics', _('Diagnostics'));
+    const statusDetailsSection = s.taboption('diagnostics', form.DummyValue, '_status_details');
+    statusDetailsSection.render = function() {
+      return E('div', { 'id': 'tailscale_status_details', 'class': 'cbi-value' },
+        renderStatusDetails(null));
+    };
+    const refreshStatusDetailsBtn = s.taboption('diagnostics', form.Button, '_refresh_status_details', _('Refresh'));
+    refreshStatusDetailsBtn.inputstyle = 'action';
+    refreshStatusDetailsBtn.onclick = function() {
+      return loadStatusDetails(true);
+    };
+
 		s.tab('logs', _('Logs'));
 		const logsSection = s.taboption('logs', form.DummyValue, '_logs');
 		logsSection.render = function () {
@@ -920,7 +983,17 @@ return view.extend({
 		//s.tab('daemon', _('Daemon Settings'));
 		//defTabOpts(s, 'daemon', daemonConf, { optional: false });
 
-		return map.render();
+    return map.render().then(function(node) {
+      // LuCI emits cbi-tab-active when a tab pane is selected. Bind to the
+      // pane itself so diagnostics are fetched only when Status is opened.
+      // Bind to the diagnostics pane, not the tab-menu item.
+      const statusPane = node.querySelector('div[data-tab="diagnostics"]');
+      if (statusPane)
+        statusPane.addEventListener('cbi-tab-active', function() {
+          loadStatusDetails(false);
+        });
+      return node;
+    });
 	},
 
 	// The handleSaveApply function saves UCI changes then applies them via the
